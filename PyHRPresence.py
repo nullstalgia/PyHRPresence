@@ -56,6 +56,7 @@ def beat_process(stop_event, new_rr, osc_settings, pulse_time):
 
 ble_devices = {}
 selected_ble_device = None
+detected_ble_devices = 0
 osc_client = None
 
 class HRData:
@@ -262,6 +263,8 @@ class HeartRateMonitor:
 
 def discovery_callback(device: BLEDevice, advertisement_data: AdvertisementData):
     global selected_ble_device
+    global detected_ble_devices
+    detected_ble_devices += 1
     if selected_ble_device is None:  # Do not add devices and print after selection
         # Check if device already exists in the list
         if device.address not in ble_devices or ble_devices[device.address][1] is None:
@@ -304,22 +307,45 @@ async def select_device(config):
     input_thread.start()
 
     await scanner.start()
-    end_time = datetime.datetime.now() + datetime.timedelta(seconds=15)
+    check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
+    end_time = datetime.datetime.now() + datetime.timedelta(seconds=60)
     while datetime.datetime.now() < end_time:
         if known_device in ble_devices or selected_ble_device is not None:
             if known_device in ble_devices:
                 print(f"{Fore.YELLOW}Known device {known_device} found. Selecting.{Fore.RESET}")
                 selected_ble_device = ble_devices[known_device]
-            await scanner.stop()
+            try:
+                await scanner.stop()
+            except AttributeError:
+                pass
             break
+        if datetime.datetime.now() > check_time and detected_ble_devices == 0:
+            print("No devices found. Restarting Scan.")
+            check_time = datetime.datetime.now() + datetime.timedelta(seconds=10)
+            try:
+                await scanner.stop()
+            except AttributeError:
+                pass
+            await asyncio.sleep(1.5)
+            await scanner.start()
+
         await asyncio.sleep(1.0)
 
     if input_thread.is_alive():
         print(f"{Style.DIM}Stopping device discovery.{Style.RESET_ALL}")
+        try:
+            await scanner.stop()
+        except AttributeError:
+            pass
         if selected_ble_device is None:
-            print("Enter device index to select: ", end="")
-            sys.stdout.flush()
-            input_thread.join()  # Wait for the input thread to finish
+            if len(ble_devices) > 0:
+                print("Enter device index to select: ", end="")
+                sys.stdout.flush()
+                input_thread.join()  # Wait for the input thread to finish
+            else:
+                print("No devices found. Exiting.")
+                return None
+        
     
     device_address = selected_ble_device[0].address
 
@@ -355,36 +381,40 @@ async def main():
     device = await select_device(config)
     save_config(config)
     if device == None:
-        raise Exception("No device address found! Retry?")
-    monitor = HeartRateMonitor(device, hrdata)
-    while True:
-        try:
+        stop_event.set()
+        beat_process_thread.terminate()
+        #beat_process_thread.join()
+        #raise Exception("No device address found! Retry?")
+    else:
+        monitor = HeartRateMonitor(device, hrdata)
+        while True:
+            try:
+                if not monitor.connected:
+                    print(f"{Fore.GREEN}Attempting to connect...{Fore.RESET}")
+                    sys.stdout.flush()
+                    await monitor.connect()
+            except TimeoutError:
+                print("Connection timed out. Retrying in 3s...")
+                await asyncio.sleep(3)
+            except BleakDeviceNotFoundError:
+                print("Device not found. Retrying in 3s...")
+                await asyncio.sleep(3)
+            except (BleakError, OSError):
+                print("BLE Error. Retrying in 15s...")
+                await asyncio.sleep(15)
+            except (asyncio.exceptions.CancelledError):
+                print("System error? Probably not good. Retrying in 3s...")
+                await asyncio.sleep(3)
+
+            # finally:
+            #     await monitor.disconnect()
+            #     await asyncio.sleep(3)
+            #     continue
+
             if not monitor.connected:
-                print(f"{Fore.GREEN}Attempting to connect...{Fore.RESET}")
-                sys.stdout.flush()
-                await monitor.connect()
-        except TimeoutError:
-            print("Connection timed out. Retrying in 3s...")
-            await asyncio.sleep(3)
-        except BleakDeviceNotFoundError:
-            print("Device not found. Retrying in 3s...")
-            await asyncio.sleep(3)
-        except (BleakError, OSError):
-            print("BLE Error. Retrying in 15s...")
-            await asyncio.sleep(15)
-        except (asyncio.exceptions.CancelledError):
-            print("System error? Probably not good. Retrying in 3s...")
-            await asyncio.sleep(3)
-
-        # finally:
-        #     await monitor.disconnect()
-        #     await asyncio.sleep(3)
-        #     continue
-
-        if not monitor.connected:
-            print("Attempting to reconnect...")
-        
-        await asyncio.sleep(1)
+                print("Attempting to reconnect...")
+            
+            await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
