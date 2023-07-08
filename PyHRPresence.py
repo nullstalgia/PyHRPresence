@@ -1,14 +1,14 @@
 import asyncio
-import time
 from bleak import BleakScanner, BleakClient
 from bleak.exc import BleakDeviceNotFoundError, BleakError
 from bleak.backends.device import BLEDevice
+from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.scanner import AdvertisementData
 from pythonosc.udp_client import SimpleUDPClient
 #import PySimpleGUI as sg
 import configparser
 import datetime
-from colorama import init, Fore, Back, Style
+from colorama import init, Fore, Style
 import os
 import struct
 from io import BytesIO
@@ -129,20 +129,22 @@ class HRData:
         self.battery = data
 
 def send_osc(is_connected, bpm, newest_rr, only_positive_floathr):
-    bundle = []
-    bundle.append((OSC_PREFIX+"isHRConnected", is_connected))
-    if is_connected:
-        bundle.append((OSC_PREFIX+"HR", bpm))
-        bundle.append((OSC_PREFIX+"RRInterval", newest_rr))
-        if only_positive_floathr:
-            bundle.append((OSC_PREFIX+"floatHR", bpm/255.0)) # 0-1 (Less accurate, but may be more useful for some applications)
+    global osc_client
+    if osc_client is not None:
+        bundle = []
+        bundle.append((OSC_PREFIX+"isHRConnected", is_connected))
+        if is_connected:
+            bundle.append((OSC_PREFIX+"HR", bpm))
+            bundle.append((OSC_PREFIX+"RRInterval", newest_rr))
+            if only_positive_floathr:
+                bundle.append((OSC_PREFIX+"floatHR", bpm/255.0)) # 0-1 (Less accurate, but may be more useful for some applications)
+            else:
+                bundle.append((OSC_PREFIX+"floatHR", (bpm*0.0078125) - 1.0)) # -1.0-1.0
         else:
-            bundle.append((OSC_PREFIX+"floatHR", (bpm*0.0078125) - 1.0)) # -1.0-1.0
-    else:
-        bundle.append((OSC_PREFIX+"isHRBeat", False))
-        
-    for msg in bundle:
-        osc_client.send_message(msg[0], msg[1])
+            bundle.append((OSC_PREFIX+"isHRBeat", False))
+            
+        for msg in bundle:
+            osc_client.send_message(msg[0], msg[1])
 
 
 def print_histogram(data, min_value, max_value):
@@ -218,6 +220,8 @@ class HeartRateMonitor:
         self.hrdata = hrdata
         self.last_battery_run = 0
         self.battery_characteristic = None
+        self.receivedZero = False
+        
         
     async def connect(self):
         self.client = BleakClient(self.device_address, disconnected_callback=self.on_disconnect)
@@ -241,15 +245,16 @@ class HeartRateMonitor:
 
     async def disconnect(self):
         #if self.connected:
-        await self.client.stop_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
-        await self.client.disconnect()
+        if self.client is not None:
+            await self.client.stop_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
+            await self.client.disconnect()
 
     def on_disconnect(self, client: BleakClient):
         self.connected = False
         self.hrdata.update_hr({'BeatsPerMinute': 0}, self.connected)
         print("Disconnected!")
 
-    async def on_hr_data_received(self, sender: int, data: bytearray):
+    async def on_hr_data_received(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         raw = read_hr_buffer(data)
         self.hrdata.update_hr(raw, self.connected)
         await self.get_battery_level()
@@ -257,9 +262,10 @@ class HeartRateMonitor:
     async def get_battery_level(self):
        if self.connected and self.battery_characteristic is not None:
             if time.time() - self.last_battery_run > (5*60):
-                value = await self.client.read_gatt_char(self.battery_characteristic)
-                self.hrdata.update_battery(int.from_bytes(value, byteorder='little'))
-                self.last_battery_run = time.time()
+                if self.client is not None:
+                    value = await self.client.read_gatt_char(self.battery_characteristic)
+                    self.hrdata.update_battery(int.from_bytes(value, byteorder='little'))
+                    self.last_battery_run = time.time()
 
 def discovery_callback(device: BLEDevice, advertisement_data: AdvertisementData):
     global selected_ble_device
@@ -298,7 +304,7 @@ async def list_devices():
 async def select_device(config):
     global selected_ble_device
     scanner = BleakScanner(
-        discovery_callback, [HEART_RATE_SERVICE_UUID], cb=dict()
+        discovery_callback, [HEART_RATE_SERVICE_UUID]
     )
 
     known_device = get_config_value(config, "ble", "saved_address")
@@ -346,7 +352,6 @@ async def select_device(config):
                 print("No devices found. Exiting.")
                 return None
         
-    
     device_address = selected_ble_device[0].address
 
     # If this wasn't a known device, ask the user if they want to save it_
