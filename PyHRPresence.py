@@ -64,8 +64,10 @@ class HRData:
         self.bpm_history = []
         self.rr_history = []
         self.bpm = 0
-        self.bpm_peak = 0
-        self.bpm_peak_time = 0
+        self.bpm_session_max = 0
+        self.bpm_session_max_time = 0
+        self.bpm_session_min = 65535
+        self.bpm_session_min_time = 0
         self.rr = 0
         self.newest_rr = 0
         self.data_length = data_length
@@ -86,9 +88,12 @@ class HRData:
             self.rr = 0
             self.newest_rr = 0
         else:
-            if self.bpm > self.bpm_peak:
-                self.bpm_peak = self.bpm
-                self.bpm_peak_time = time.time()
+            if self.bpm > self.bpm_session_max:
+                self.bpm_session_max = self.bpm
+                self.bpm_session_max_time = time.time()
+            elif self.bpm < self.bpm_session_min and self.bpm > 0:
+                self.bpm_session_min = self.bpm
+                self.bpm_session_min_time = time.time()
             if "RRIntervals" in data.keys():
                 self.rr = data['RRIntervals']
                 self.newest_rr = self.rr[-1]
@@ -109,8 +114,10 @@ class HRData:
         #pprint(raw)
         print(f"BPM: {self.bpm}")
         
-        if self.bpm_peak > 0:
-            print(f"Peak: {self.bpm_peak} BPM at {time.strftime('%I:%M%p', time.localtime(self.bpm_peak_time))}")
+        if self.bpm_session_max > 0:
+            print(f"Session Max BPM: {self.bpm_session_max} BPM at {time.strftime('%I:%M%p', time.localtime(self.bpm_session_max_time))}")
+        if self.bpm_session_min < 65535:
+            print(f"Session Min BPM: {self.bpm_session_min} BPM at {time.strftime('%I:%M%p', time.localtime(self.bpm_session_min_time))}")
 
         if type(self.rr) == list:
             print(f"RR: {self.rr} (ms)")
@@ -118,7 +125,7 @@ class HRData:
             print(f"RR: {self.rr}ms")
             
         if self.battery > -1:
-            print(f"Battery: {Fore.RED if self.battery < 50 else Fore.WHITE}{self.battery}%{Fore.RESET}")
+            print(f"Battery: {Fore.RED if self.battery < 30 else Fore.WHITE}{self.battery}%{Fore.RESET}")
 
         print_histogram(self.bpm_history, 30, 250)
 
@@ -220,7 +227,8 @@ class HeartRateMonitor:
         self.hrdata = hrdata
         self.last_battery_run = 0
         self.battery_characteristic = None
-        self.receivedZero = False
+        self.receivedZero = 0
+        self.receivedNonZero = 0
         
         
     async def connect(self):
@@ -249,7 +257,7 @@ class HeartRateMonitor:
             await self.client.stop_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
             await self.client.disconnect()
 
-    def on_disconnect(self, client: BleakClient):
+    def on_disconnect(self, client: BleakClient | None = None):
         self.connected = False
         self.hrdata.update_hr({'BeatsPerMinute': 0}, self.connected)
         print("Disconnected!")
@@ -257,6 +265,23 @@ class HeartRateMonitor:
     async def on_hr_data_received(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         raw = read_hr_buffer(data)
         self.hrdata.update_hr(raw, self.connected)
+        bpm = raw['BeatsPerMinute']
+        if not self.connected or bpm == 0:
+            self.battery_characteristic = None
+        if bpm == 0:
+            self.receivedZero += 1
+            self.receivedNonZero = 0
+        elif bpm > 0 and self.connected == False:
+            self.receivedNonZero += 1
+            self.receivedZero = 0
+
+        if self.client is not None:
+            if self.receivedZero > 10:
+                self.connected = False
+                await self.client.disconnect()
+            elif self.receivedNonZero > 5:
+                self.connected = True
+                self.receivedNonZero = 0
         await self.get_battery_level()
 
     async def get_battery_level(self):
@@ -311,7 +336,8 @@ async def select_device(config):
 
     input_thread = Thread(target=device_selection_loop)
     input_thread.start()
-
+    print("Scanning for BLE Heart Rate devices...")
+    sys.stdout.flush()
     await scanner.start()
     check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=60)
