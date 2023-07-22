@@ -17,7 +17,45 @@ from pprint import pprint
 from distutils.util import strtobool
 import multiprocessing
 import sys
-from threading import Thread
+from threading import Thread, Timer
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Create a logger
+logger = logging.getLogger(__name__)
+
+# Create a file handler which rotates the log 
+file_handler = RotatingFileHandler('pyhrpresence.log', maxBytes=5000, backupCount=5)
+file_handler.setLevel(logging.DEBUG)
+
+# Create a logging format for files
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+
+# Create a logging format for the console
+stream_formatter = logging.Formatter('%(message)s')
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(stream_formatter)
+
+# Add the handlers to the logger
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
+
+logger.setLevel(logging.DEBUG)
+def decode_logging_level(level: str) -> int:
+    if level.lower() == "debug":
+        return logging.DEBUG
+    elif level.lower() == "info":
+        return logging.INFO
+    elif level.lower() == "warning":
+        return logging.WARNING
+    elif level.lower() == "error":
+        return logging.ERROR
+    elif level.lower() == "critical":
+        return logging.CRITICAL
+    else:
+        return logging.INFO
 
 HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
@@ -30,7 +68,7 @@ OSC_PORT = 9000
 
 OSC_PREFIX = "/avatar/parameters/"
 
-CONVERSION_FACTOR = 0.9765625 # 1000/1024, since the RR values are 1/1024 of a second
+RR_CONVERSION_FACTOR = 0.9765625 # 1000/1024, since the RR values are 1/1024 of a second
 # according to https://www.bluetooth.org/docman/handlers/DownloadDoc.ashx?doc_id=555004 (GATT Specification Supplement v8) page 123
 
 # This has been put into its own process so the GIL can't 
@@ -54,6 +92,24 @@ def beat_process(stop_event, new_rr, osc_settings, pulse_time):
             time.sleep(1)
 
 
+class TimeoutTimer:
+    def __init__(self, timeout, callback):
+        self.timeout = timeout
+        self.callback = callback
+        self.timer = None
+
+    def reset(self):
+        if self.timer:
+            self.timer.cancel()
+
+        loop = asyncio.get_event_loop()
+        self.timer = loop.call_later(self.timeout, lambda: loop.create_task(self.callback()))
+
+    def stop(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+
 ble_devices = {}
 selected_ble_device = None
 detected_ble_devices = 0
@@ -75,12 +131,16 @@ class HRData:
         self.is_connected = False
         self.rr_output = rr_output
         self.config = config
-        self.only_positive_floathr = bool(strtobool(get_config_value(config, "osc", "only_positive_floathr", "False")))
         self.battery = -1
-        set_config_value(config, "osc", "only_positive_floathr", str(self.only_positive_floathr))
+        self.only_positive_floathr = bool(strtobool(get_config_value(config, "osc", "only_positive_floathr", "False", True)))
+        self.should_txt_write = bool(strtobool(get_config_value(config, "misc", "write_bpm_to_file", "False", True)))
+        self.txt_write_path = get_config_value(config, "misc", "write_bpm_file_path", "bpm.txt", True)
+        self.timer = TimeoutTimer(15, self.timeout_callback)
+        self.disconnect_call = None
 
     
     def update_hr(self, data, is_connected):
+        self.timer.reset()
         self.is_connected = is_connected
         self.bpm = data['BeatsPerMinute']
         
@@ -94,10 +154,11 @@ class HRData:
             elif self.bpm < self.bpm_session_min and self.bpm > 0:
                 self.bpm_session_min = self.bpm
                 self.bpm_session_min_time = time.time()
+                
             if "RRIntervals" in data.keys():
                 self.rr = data['RRIntervals']
                 self.newest_rr = self.rr[-1]
-                self.newest_rr *= CONVERSION_FACTOR
+                self.newest_rr *= RR_CONVERSION_FACTOR
                 self.newest_rr = int(self.newest_rr)
             else:
                 self.rr = int(60000/data['BeatsPerMinute'])
@@ -130,12 +191,26 @@ class HRData:
         print_histogram(self.bpm_history, 30, 250)
 
         self.rr_output.value = self.newest_rr
-        send_osc(self.is_connected, self.bpm, self.newest_rr, self.only_positive_floathr)
+        send_osc(self.is_connected, self.bpm, self.newest_rr, self.only_positive_floathr, self.should_txt_write, self.txt_write_path)
+
+    def update_hr_to_zero(self, connected=False):
+        self.bpm = 0
+        self.update_hr({'BeatsPerMinute': 0}, connected)
 
     def update_battery(self, data):
         self.battery = data
 
-def send_osc(is_connected, bpm, newest_rr, only_positive_floathr):
+    async def timeout_callback(self):
+        self.is_connected = False
+        self.bpm = 0
+        logger.error("Stopped recieving data. Disconnecting.")
+        sys.stdout.flush()
+        self.update_hr_to_zero()
+        await self.disconnect_call() # type: ignore
+        # TODO: Find ways around pylance complaining about awaiting Never and calling None
+
+
+def send_osc(is_connected, bpm, newest_rr, only_positive_floathr, should_txt_write, txt_write_path):
     global osc_client
     if osc_client is not None:
         bundle = []
@@ -153,6 +228,14 @@ def send_osc(is_connected, bpm, newest_rr, only_positive_floathr):
         for msg in bundle:
             osc_client.send_message(msg[0], msg[1])
 
+    if should_txt_write:
+        with open(txt_write_path, "w") as f:
+            if is_connected:
+                f.write(str(bpm))
+                #f.write("\n")
+                #f.write(str(self.newest_rr))                
+            else:
+                f.write("D/C")
 
 def print_histogram(data, min_value, max_value):
     histogram_height = 10  # height of the histogram
@@ -173,10 +256,16 @@ def load_config():
     return config
 
 
-def get_config_value(config, section, key, default=None):
+def get_config_value(config, section, key, default=None, save=True):
     if config.has_section(section) and config.has_option(section, key):
-        return config.get(section, key)
-    return default
+        value = config.get(section, key)
+    else:
+        value = default
+
+    if save:
+        set_config_value(config, section, key, value)
+
+    return value
 
 def set_config_value(config, section, key, value):
     if not config.has_section(section):
@@ -232,9 +321,15 @@ class HeartRateMonitor:
         
         
     async def connect(self):
+        logger.debug("Created client.")
+        sys.stdout.flush()
         self.client = BleakClient(self.device_address, disconnected_callback=self.on_disconnect)
         try:
+            logger.debug("Connecting.")
+            sys.stdout.flush()
             self.connected = await self.client.connect()
+            logger.debug("Connected, checking if battery service is available.")
+            sys.stdout.flush()
             if self.connected:
                 await self.client.start_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID, self.on_hr_data_received)
                 # Check if the device has the battery service
@@ -248,7 +343,7 @@ class HeartRateMonitor:
                                 break
                 
         except asyncio.exceptions.CancelledError:
-            print("Couldn't connect to device, try again?")
+            logger.error("Couldn't connect to device, try again?")
             pass
 
     async def disconnect(self):
@@ -259,8 +354,8 @@ class HeartRateMonitor:
 
     def on_disconnect(self, client: BleakClient | None = None):
         self.connected = False
-        self.hrdata.update_hr({'BeatsPerMinute': 0}, self.connected)
-        print("Disconnected!")
+        self.hrdata.update_hr_to_zero()
+        logger.info("Disconnected!")
 
     async def on_hr_data_received(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         raw = read_hr_buffer(data)
@@ -316,7 +411,7 @@ def device_selection_loop():
         choice = input()
         if choice.isdigit() and int(choice) in range(len(ble_devices)):
             selected_ble_device = list(ble_devices.values())[int(choice)]
-            print(f"{Style.DIM}Selected device {selected_ble_device[0].address}{Style.RESET_ALL}")
+            logger.info(f"{Style.DIM}Selected device {selected_ble_device[0].address}{Style.RESET_ALL}")
             break
 
 
@@ -336,7 +431,7 @@ async def select_device(config):
 
     input_thread = Thread(target=device_selection_loop)
     input_thread.start()
-    print("Scanning for BLE Heart Rate devices...")
+    logger.info("Scanning for BLE Heart Rate devices...")
     sys.stdout.flush()
     await scanner.start()
     check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
@@ -344,7 +439,7 @@ async def select_device(config):
     while datetime.datetime.now() < end_time:
         if known_device in ble_devices or selected_ble_device is not None:
             if known_device in ble_devices:
-                print(f"{Fore.YELLOW}Known device {known_device} found. Selecting.{Fore.RESET}")
+                logger.info(f"{Fore.YELLOW}Known device {known_device} found. Selecting.{Fore.RESET}")
                 selected_ble_device = ble_devices[known_device]
             try:
                 await scanner.stop()
@@ -352,7 +447,7 @@ async def select_device(config):
                 pass
             break
         if datetime.datetime.now() > check_time and detected_ble_devices == 0:
-            print("No devices found. Restarting Scan.")
+            logger.info("No devices found. Restarting Scan.")
             check_time = datetime.datetime.now() + datetime.timedelta(seconds=10)
             try:
                 await scanner.stop()
@@ -364,7 +459,7 @@ async def select_device(config):
         await asyncio.sleep(1.0)
 
     if input_thread.is_alive():
-        print(f"{Style.DIM}Stopping device discovery.{Style.RESET_ALL}")
+        logger.info(f"{Style.DIM}Stopping device discovery.{Style.RESET_ALL}")
         try:
             await scanner.stop()
         except AttributeError:
@@ -375,7 +470,7 @@ async def select_device(config):
                 sys.stdout.flush()
                 input_thread.join()  # Wait for the input thread to finish
             else:
-                print("No devices found. Exiting.")
+                logger.info("No devices found. Exiting.")
                 return None
         
     device_address = selected_ble_device[0].address
@@ -390,27 +485,35 @@ async def select_device(config):
 
 async def main():
     global osc_client, OSC_IP, OSC_PORT
+
+    # Read config
     config = load_config()
-    OSC_IP = get_config_value(config, "osc", "ip", OSC_IP)
-    OSC_PORT = int(get_config_value(config, "osc", "port", OSC_PORT))
-    set_config_value(config, "osc", "ip", OSC_IP)
-    set_config_value(config, "osc", "port", str(OSC_PORT))
+    OSC_IP = get_config_value(config, "osc", "ip", OSC_IP, True)
+    OSC_PORT = int(get_config_value(config, "osc", "port", OSC_PORT, True))
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
+    pulse_length = int(get_config_value(config, "osc", "pulse_length", 100, True))
+
+    # Set console log level
+    stream_handler.setLevel(decode_logging_level(get_config_value(config, "misc", "console_log_level", "info", True)))
 
     # Set up beat process
     stop_event = multiprocessing.Event()
     new_rr = multiprocessing.Value('i', -1)
     osc_settings = {"ip": OSC_IP, "port": OSC_PORT, "prefix": OSC_PREFIX}
-    pulse_length = int(get_config_value(config, "osc", "pulse_length", 100))
-    set_config_value(config, "osc", "pulse_length", str(pulse_length))
 
     beat_process_thread = multiprocessing.Process(target=beat_process, args=(stop_event, new_rr, osc_settings, pulse_length))
     beat_process_thread.start()
 
+    # Set up timeout timer for recieving data
+
     hrdata = HRData(new_rr, config)
-    send_osc(False, 0, 0, hrdata.only_positive_floathr)
+
+    send_osc(False, 0, 0, hrdata.only_positive_floathr, hrdata.should_txt_write, hrdata.txt_write_path)
     device = await select_device(config)
+
+    # Should only save after device selection and hrdata init, since they may modify the config
     save_config(config)
+
     if device == None:
         stop_event.set()
         beat_process_thread.terminate()
@@ -418,23 +521,25 @@ async def main():
         #raise Exception("No device address found! Retry?")
     else:
         monitor = HeartRateMonitor(device, hrdata)
+        hrdata.disconnect_call = monitor.disconnect # type: ignore
+        # TODO: Find ways around pylance complaining about assigning to None
         while True:
             try:
                 if not monitor.connected:
-                    print(f"{Fore.GREEN}Attempting to connect...{Fore.RESET}")
+                    logger.info(f"{Fore.GREEN}Attempting to connect...{Fore.RESET}")
                     sys.stdout.flush()
                     await monitor.connect()
             except TimeoutError:
-                print("Connection timed out. Retrying in 3s...")
+                logger.error("Connection timed out. Retrying in 3s...")
                 await asyncio.sleep(3)
             except BleakDeviceNotFoundError:
-                print("Device not found. Retrying in 3s...")
+                logger.error("Device not found. Retrying in 3s...")
                 await asyncio.sleep(3)
             except (BleakError, OSError):
-                print("BLE Error. Retrying in 15s...")
+                logger.error("BLE Error. Retrying in 15s...")
                 await asyncio.sleep(15)
             except (asyncio.exceptions.CancelledError):
-                print("System error? Probably not good. Retrying in 3s...")
+                logger.error("System error? Probably not good. Retrying in 3s...")
                 await asyncio.sleep(3)
 
             # finally:
@@ -443,7 +548,7 @@ async def main():
             #     continue
 
             if not monitor.connected:
-                print("Attempting to reconnect...")
+                logger.info("Attempting to reconnect...")
             
             await asyncio.sleep(1)
 
