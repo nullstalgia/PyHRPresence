@@ -12,6 +12,13 @@ only_positive_floathr = False
 
 [ble]
 saved_address = xx:xx:xx:xx:xx:xx
+saved_name = Polar H10 XXXXXXXX
+
+[misc]
+write_bpm_to_file = False
+write_bpm_file_path = bpm.txt
+console_log_level = info
+
 ```
 
 ## OSC Parameters

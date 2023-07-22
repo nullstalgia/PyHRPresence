@@ -17,15 +17,15 @@ from pprint import pprint
 from distutils.util import strtobool
 import multiprocessing
 import sys
-from threading import Thread, Timer
+from threading import Thread
 import logging
 from logging.handlers import RotatingFileHandler
 
 # Create a logger
 logger = logging.getLogger(__name__)
+log_path = 'pyhrpresence.log'
 
-# Create a file handler which rotates the log 
-file_handler = RotatingFileHandler('pyhrpresence.log', maxBytes=5000, backupCount=5)
+file_handler = RotatingFileHandler(log_path, maxBytes=1024*1024*10, backupCount=3)
 file_handler.setLevel(logging.DEBUG)
 
 # Create a logging format for files
@@ -43,6 +43,17 @@ logger.addHandler(stream_handler)
 logger.addHandler(file_handler)
 
 logger.setLevel(logging.DEBUG)
+
+# This is kinda awful but it will be very helpful for debugging
+old_hook = sys.excepthook
+def exception_handler(exc_type, exc_value, exc_traceback):
+    # Handle uncaught exception
+    logger.error("Uncaught exception", 
+                 exc_info=(exc_type, exc_value, exc_traceback))
+    old_hook(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = exception_handler
+
 def decode_logging_level(level: str) -> int:
     if level.lower() == "debug":
         return logging.DEBUG
@@ -233,7 +244,7 @@ def send_osc(is_connected, bpm, newest_rr, only_positive_floathr, should_txt_wri
             if is_connected:
                 f.write(str(bpm))
                 #f.write("\n")
-                #f.write(str(self.newest_rr))                
+                #f.write(str(self.newest_rr))
             else:
                 f.write("D/C")
 
@@ -263,7 +274,7 @@ def get_config_value(config, section, key, default=None, save=True):
         value = default
 
     if save:
-        set_config_value(config, section, key, value)
+        set_config_value(config, section, key, str(value))
 
     return value
 
@@ -427,7 +438,8 @@ async def select_device(config):
         discovery_callback, [HEART_RATE_SERVICE_UUID]
     )
 
-    known_device = get_config_value(config, "ble", "saved_address")
+    known_device_address = get_config_value(config, "ble", "saved_address")
+    known_device_name = get_config_value(config, "ble", "saved_name")
 
     input_thread = Thread(target=device_selection_loop)
     input_thread.start()
@@ -437,10 +449,18 @@ async def select_device(config):
     check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=60)
     while datetime.datetime.now() < end_time:
-        if known_device in ble_devices or selected_ble_device is not None:
-            if known_device in ble_devices:
-                logger.info(f"{Fore.YELLOW}Known device {known_device} found. Selecting.{Fore.RESET}")
-                selected_ble_device = ble_devices[known_device]
+        device_selected = selected_ble_device is not None
+        known_device_address_found = (known_device_address in ble_devices)
+        # uhhh thanks copilot
+        known_device_name_found = (known_device_name is not None and (known_device_name in [device[1] for device in ble_devices.values()]))
+        if known_device_address_found or known_device_name_found or device_selected:
+            if known_device_address_found:
+                logger.info(f"{Fore.YELLOW}Known device {known_device_address} found. Selecting.{Fore.RESET}")
+                selected_ble_device = ble_devices[known_device_address]
+            elif known_device_name_found:
+                logger.info(f"{Fore.YELLOW}Known device {known_device_name} found. Selecting.{Fore.RESET}")
+                # this works, thanks again copilot
+                selected_ble_device = [device for device in ble_devices.values() if device[1] == known_device_name][0]
             try:
                 await scanner.stop()
             except AttributeError:
@@ -475,11 +495,17 @@ async def select_device(config):
         
     device_address = selected_ble_device[0].address
 
-    # If this wasn't a known device, ask the user if they want to save it_
-    if selected_ble_device is not None and known_device != device_address:
+    # To account for people who didn't have saved_name, but did reconnect to a saved device, we should check if it's None and if the selected name isn't None, then save it if so
+    # Yeesh.
+    if known_device_address is not None and device_address is known_device_address and known_device_name is None and selected_ble_device[1] is not None:
+        set_config_value(config, "ble", "saved_address", device_address)
+        set_config_value(config, "ble", "saved_name", selected_ble_device[1])
+
+    # If this wasn't a known device, ask the user if they want to save it
+    if selected_ble_device is not None and (known_device_address != device_address and known_device_name != selected_ble_device[1]):
         if strtobool(input("Save this device? (Y/N) ")):
             set_config_value(config, "ble", "saved_address", device_address)
-            save_config(config)
+            set_config_value(config, "ble", "saved_name", selected_ble_device[1])
 
     return device_address
 
