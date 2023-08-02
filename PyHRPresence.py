@@ -20,6 +20,7 @@ import sys
 from threading import Thread
 import logging
 from logging.handlers import RotatingFileHandler
+from pynput.keyboard import Key, Listener
 from Includes.ConfigFunctions import load_config, get_config_value, set_config_value, save_config
 
 # Create a logger
@@ -396,14 +397,44 @@ def print_ble_devices():
         #pprint(device[1])
     print("Enter device index to select: ")
 
-def device_selection_loop():
+def on_device_press(key: Key):
     global selected_ble_device
-    while selected_ble_device is None:  # Exit the loop once a device is selected
-        choice = input()
-        if choice.isdigit() and int(choice) in range(len(ble_devices)):
-            selected_ble_device = list(ble_devices.values())[int(choice)]
-            logger.info(f"{Style.DIM}Selected device {selected_ble_device[0].address}{Style.RESET_ALL}")
-            break
+    choice = -1
+    try:
+        # Check if the pressed key is a digit and within the range of devices
+        if hasattr(key, 'char'):
+            choice = int(key.char)
+    except (ValueError, TypeError, AttributeError):
+        # Ignore keys that are not digits
+        # Numpad handling
+        if hasattr(key, 'vk') and 96 <= key.vk <= 105 and choice == -1:
+            choice = key.vk - 96
+        else:
+            return
+            
+    if choice in range(len(ble_devices)):
+        selected_ble_device = list(ble_devices.values())[choice]
+        logger.info(f"{Style.DIM}Selected device {selected_ble_device[0].address}{Style.RESET_ALL}")
+        # Stop the listener when a valid choice is made
+        return False
+
+def on_save_press(key):
+    global should_save
+    # Detecting if the key pressed is Y for yes, N for no
+    try:
+        if str(key.char).lower() == "y":
+            should_save = True
+            return False
+        elif str(key.char).lower() == "n":
+            should_save = False
+            return False
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+def device_selection_loop():
+    # Start the listener
+    with Listener(on_press=on_device_press) as listener:
+        listener.join()
 
 
 async def list_devices():
@@ -422,13 +453,18 @@ async def select_device(config):
     known_device_name = get_config_value(config, "ble", "saved_name")
 
     input_thread = Thread(target=device_selection_loop)
-    input_thread.start()
+    input_thread_ever_started = False
     logger.info("Scanning for BLE Heart Rate devices...")
     sys.stdout.flush()
     await scanner.start()
     check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=120)
     while datetime.datetime.now() < end_time:
+        # If any devices have been found, turn on the input thread
+        if detected_ble_devices > 0 and not input_thread_ever_started:
+            input_thread_ever_started = True
+            input_thread.start()
+
         device_selected = selected_ble_device is not None
         known_device_address_found = (known_device_address in ble_devices)
         # uhhh thanks copilot
@@ -456,24 +492,25 @@ async def select_device(config):
             await asyncio.sleep(1.5)
             await scanner.start()
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
 
-    if input_thread.is_alive():
-        logger.info(f"{Style.DIM}Stopping device discovery.{Style.RESET_ALL}")
-        try:
-            await scanner.stop()
-        except AttributeError:
-            pass
-        if selected_ble_device is None:
-            if len(ble_devices) > 0:
-                print("Enter device index to select: ", end="")
-                sys.stdout.flush()
-                input_thread.join()  # Wait for the input thread to finish
-            else:
-                logger.info("No devices found. Exiting.")
-                return None
+    logger.info(f"{Style.DIM}Stopping device discovery.{Style.RESET_ALL}")
+    try:
+        await scanner.stop()
+    except AttributeError:
+        pass
+    if selected_ble_device is None:
+        if len(ble_devices) > 0:
+            print("Enter device index to select: ", end="")
+            sys.stdout.flush()
+            input_thread.join()  # Wait for the input thread to finish
+        else:
+            logger.info("No devices found. Exiting.")
+            return None
         
     device_address = selected_ble_device[0].address
+
+    # TODO: Redo logic for saving names/addresses when already saved.
 
     # To account for people who didn't have saved_name, but did reconnect to a saved device, we should check if it's None and if the selected name isn't None, then save it if so
     # Yeesh.
@@ -483,7 +520,15 @@ async def select_device(config):
 
     # If this wasn't a known device, ask the user if they want to save it
     if selected_ble_device is not None and (known_device_address != device_address and known_device_name != selected_ble_device[1]):
-        if strtobool(input("Save this device? (Y/N) ")):
+        global should_save
+        should_save = None
+        # To avoid poking the prompt on device selection
+        await asyncio.sleep(1)
+
+        print("Save this device? (Y/N) ")
+        with Listener(on_press=on_save_press) as listener:
+            listener.join()
+        if should_save:
             set_config_value(config, "ble", "saved_address", device_address)
             set_config_value(config, "ble", "saved_name", selected_ble_device[1])
 
@@ -510,7 +555,6 @@ async def main():
     osc_settings = {"ip": OSC_IP, "port": OSC_PORT, "prefix": OSC_PREFIX}
 
     beat_process_thread = multiprocessing.Process(target=beat_process, args=(stop_event, new_rr, osc_settings, pulse_length))
-    beat_process_thread.start()
 
     # Set up timeout timer for recieving data
 
@@ -524,13 +568,17 @@ async def main():
 
     if device == None:
         stop_event.set()
-        beat_process_thread.terminate()
+        try:
+            beat_process_thread.terminate() 
+        except AttributeError:
+            pass
         #beat_process_thread.join()
         #raise Exception("No device address found! Retry?")
     else:
         monitor = HeartRateMonitor(device, hrdata)
         hrdata.disconnect_call = monitor.disconnect # type: ignore
         # TODO: Find ways around pylance complaining about assigning to None
+        beat_process_thread.start()
         while True:
             try:
                 if not monitor.connected:
