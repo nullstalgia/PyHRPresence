@@ -20,6 +20,7 @@ import sys
 from threading import Thread
 import logging
 from logging.handlers import RotatingFileHandler
+from Includes.ConfigFunctions import load_config, get_config_value, set_config_value, save_config
 
 # Create a logger
 logger = logging.getLogger(__name__)
@@ -261,32 +262,6 @@ def print_histogram(data, min_value, max_value):
     for row in reversed(histogram):
         print(''.join(row))
 
-def load_config():
-    config = configparser.ConfigParser()
-    config.read('pyhrpresence.ini')
-    return config
-
-
-def get_config_value(config, section, key, default=None, save=True):
-    if config.has_section(section) and config.has_option(section, key):
-        value = config.get(section, key)
-    else:
-        value = default
-
-    if save:
-        set_config_value(config, section, key, str(value))
-
-    return value
-
-def set_config_value(config, section, key, value):
-    if not config.has_section(section):
-        config.add_section(section)
-    config.set(section, key, value)
-
-def save_config(config):
-    with open('pyhrpresence.ini', 'w') as configfile:
-        config.write(configfile)
-
 def read_hr_buffer(data):
     length = len(data)
     if length == 0:
@@ -360,8 +335,13 @@ class HeartRateMonitor:
     async def disconnect(self):
         #if self.connected:
         if self.client is not None:
-            await self.client.stop_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
-            await self.client.disconnect()
+            try:
+                await self.client.stop_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
+                await self.client.disconnect()
+            except (KeyError, BleakError, AttributeError):
+                # Not exactly sure why these get thrown, hopefully this helps
+                # I think sometimes on disconnecting when it may already be DC'd, it just double freaks out and throws exceptions?
+                pass
 
     def on_disconnect(self, client: BleakClient | None = None):
         self.connected = False
@@ -447,7 +427,7 @@ async def select_device(config):
     sys.stdout.flush()
     await scanner.start()
     check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
-    end_time = datetime.datetime.now() + datetime.timedelta(seconds=60)
+    end_time = datetime.datetime.now() + datetime.timedelta(seconds=120)
     while datetime.datetime.now() < end_time:
         device_selected = selected_ble_device is not None
         known_device_address_found = (known_device_address in ble_devices)
@@ -468,7 +448,7 @@ async def select_device(config):
             break
         if datetime.datetime.now() > check_time and detected_ble_devices == 0:
             logger.info("No devices found. Restarting Scan.")
-            check_time = datetime.datetime.now() + datetime.timedelta(seconds=10)
+            check_time = datetime.datetime.now() + datetime.timedelta(seconds=15)
             try:
                 await scanner.stop()
             except AttributeError:
@@ -509,13 +489,15 @@ async def select_device(config):
 
     return device_address
 
+
 async def main():
-    global osc_client, OSC_IP, OSC_PORT
+    global osc_client, OSC_IP, OSC_PORT, OSC_PREFIX
 
     # Read config
     config = load_config()
     OSC_IP = get_config_value(config, "osc", "ip", OSC_IP, True)
     OSC_PORT = int(get_config_value(config, "osc", "port", OSC_PORT, True))
+    OSC_PREFIX = get_config_value(config, "osc", "prefix", OSC_PREFIX, True)
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
     pulse_length = int(get_config_value(config, "osc", "pulse_length", 100, True))
 

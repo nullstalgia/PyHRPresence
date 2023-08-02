@@ -9,6 +9,7 @@ ip = 127.0.0.1
 port = 9000
 pulse_length = 100
 only_positive_floathr = False
+prefix = /avatar/parameters/
 
 [ble]
 saved_address = xx:xx:xx:xx:xx:xx
@@ -19,6 +20,10 @@ write_bpm_to_file = False
 write_bpm_file_path = bpm.txt
 console_log_level = info
 
+[dummy]
+hi_bpm = 190
+lo_bpm = 40
+loops_before_dc = 5
 ```
 
 ## OSC Parameters
