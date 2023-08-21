@@ -48,6 +48,13 @@ logger.addHandler(file_handler)
 
 logger.setLevel(logging.DEBUG)
 
+# From https://stackoverflow.com/a/42615559
+# determine if application is a script file or frozen exe
+if getattr(sys, 'frozen', False):
+    application_path = os.path.dirname(sys.executable)
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
 # This is kinda awful but it will be very helpful for debugging
 old_hook = sys.excepthook
 def exception_handler(exc_type, exc_value, exc_traceback):
@@ -567,7 +574,7 @@ async def main():
     pulse_length = int(get_config_value(config, "osc", "pulse_length", 100, True))
 
     log_sessions_to_csv = bool(strtobool(get_config_value(config, "misc", "log_sessions_to_csv", "False", True)))
-    session_log_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "session_logs", f"PyHRP-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+    session_log_path = os.path.join(application_path, "session_logs", f"PyHRP-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
     session_log_created = False
 
     # Set console log level
