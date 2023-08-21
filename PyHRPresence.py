@@ -21,6 +21,8 @@ from threading import Thread
 import logging
 from logging.handlers import RotatingFileHandler
 from pynput.keyboard import Key, Listener
+import csv
+from async_timeout import timeout
 from Includes.ConfigFunctions import load_config, get_config_value, set_config_value, save_config
 
 # Create a logger
@@ -129,7 +131,7 @@ detected_ble_devices = 0
 osc_client = None
 
 class HRData:
-    def __init__(self, rr_output, config, data_length=30):
+    def __init__(self, rr_output, config, session_log_path, data_length=30):
         self.bpm_history = []
         self.rr_history = []
         self.bpm = 0
@@ -150,7 +152,7 @@ class HRData:
         self.txt_write_path = get_config_value(config, "misc", "write_bpm_file_path", "bpm.txt", True)
         self.timer = TimeoutTimer(15, self.timeout_callback)
         self.disconnect_call = None
-
+        self.session_log_path = session_log_path
     
     def update_hr(self, data, is_connected):
         self.timer.reset()
@@ -206,6 +208,14 @@ class HRData:
         self.rr_output.value = self.newest_rr
         send_osc(self.is_connected, self.bpm, self.newest_rr, self.only_positive_floathr, self.should_txt_write, self.txt_write_path)
 
+        # Not checking if logging is enabled, since if it wasn't, this would never be True
+        if session_log_created:
+            session_log_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "session_logs", f"PyHRP-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+            with open(self.session_log_path, "a", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), self.bpm, self.newest_rr, self.battery])
+
+
     def update_hr_to_zero(self, connected=False):
         self.bpm = 0
         self.update_hr({'BeatsPerMinute': 0}, connected)
@@ -216,9 +226,9 @@ class HRData:
     async def timeout_callback(self):
         self.is_connected = False
         self.bpm = 0
+        self.update_hr_to_zero()
         logger.error("Stopped recieving data. Disconnecting.")
         sys.stdout.flush()
-        self.update_hr_to_zero()
         await self.disconnect_call() # type: ignore
         # TODO: Find ways around pylance complaining about awaiting Never and calling None
 
@@ -308,30 +318,37 @@ class HeartRateMonitor:
         
         
     async def connect(self):
+        self.client = BleakClient(self.device_address, disconnected_callback=self.on_disconnect)
         logger.debug("Created client.")
         sys.stdout.flush()
-        self.client = BleakClient(self.device_address, disconnected_callback=self.on_disconnect)
-        try:
-            logger.debug("Connecting.")
-            sys.stdout.flush()
-            self.connected = await self.client.connect()
-            logger.debug("Connected, checking if battery service is available.")
-            sys.stdout.flush()
-            if self.connected:
-                await self.client.start_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID, self.on_hr_data_received)
-                # Check if the device has the battery service
-                for service in self.client.services:
-                    if service.uuid == BATTERY_SERVICE_UUID:
+        
+        # If this actually exceeds 30 seconds, something has gone horribly wrong
+        async with timeout(30) as cm:
+            try:
+                logger.debug("Connecting.")
+                sys.stdout.flush()
+                self.connected = await self.client.connect()
+                logger.debug("Connected, checking if battery service is available.")
+                sys.stdout.flush()
+                if self.connected:
+                    await self.client.start_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID, self.on_hr_data_received)
+                    # Check if the device has the battery service
+                    for service in self.client.services:
+                        if service.uuid == BATTERY_SERVICE_UUID:
 
-                        for characteristic in service.characteristics:
-                            if characteristic.uuid == BATTERY_LEVEL_CHARACTERISTIC_UUID:
-                                # Add the battery level function to the task loop if it's not already there
-                                self.battery_characteristic = characteristic
-                                break
-                
-        except asyncio.exceptions.CancelledError:
-            logger.error("Couldn't connect to device, try again?")
-            pass
+                            for characteristic in service.characteristics:
+                                if characteristic.uuid == BATTERY_LEVEL_CHARACTERISTIC_UUID:
+                                    # Add the battery level function to the task loop if it's not already there
+                                    self.battery_characteristic = characteristic
+                                    break
+                    
+            except asyncio.exceptions.CancelledError:
+                logger.error("Couldn't connect to device, try again?")
+                pass
+        if cm.expired:
+            logger.error("Timed out while connecting...")
+            self.connected = False
+            sys.stdout.flush()
 
     async def disconnect(self):
         #if self.connected:
@@ -342,6 +359,9 @@ class HeartRateMonitor:
             except (KeyError, BleakError, AttributeError):
                 # Not exactly sure why these get thrown, hopefully this helps
                 # I think sometimes on disconnecting when it may already be DC'd, it just double freaks out and throws exceptions?
+
+                # Adding this to see if it helps with not re-connecting after timing out/leaving BLE range.
+                self.connected = False
                 pass
 
     def on_disconnect(self, client: BleakClient | None = None):
@@ -536,7 +556,7 @@ async def select_device(config):
 
 
 async def main():
-    global osc_client, OSC_IP, OSC_PORT, OSC_PREFIX
+    global osc_client, OSC_IP, OSC_PORT, OSC_PREFIX, session_log_created
 
     # Read config
     config = load_config()
@@ -545,6 +565,10 @@ async def main():
     OSC_PREFIX = get_config_value(config, "osc", "prefix", OSC_PREFIX, True)
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
     pulse_length = int(get_config_value(config, "osc", "pulse_length", 100, True))
+
+    log_sessions_to_csv = bool(strtobool(get_config_value(config, "misc", "log_sessions_to_csv", "False", True)))
+    session_log_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "session_logs", f"PyHRP-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+    session_log_created = False
 
     # Set console log level
     stream_handler.setLevel(decode_logging_level(get_config_value(config, "misc", "console_log_level", "info", True)))
@@ -558,7 +582,7 @@ async def main():
 
     # Set up timeout timer for recieving data
 
-    hrdata = HRData(new_rr, config)
+    hrdata = HRData(new_rr, config, session_log_path)
 
     send_osc(False, 0, 0, hrdata.only_positive_floathr, hrdata.should_txt_write, hrdata.txt_write_path)
     device = await select_device(config)
@@ -585,6 +609,15 @@ async def main():
                     logger.info(f"{Fore.GREEN}Attempting to connect...{Fore.RESET}")
                     sys.stdout.flush()
                     await monitor.connect()
+                    
+                    # Set up the logging CSV if enabled
+                    if log_sessions_to_csv and not session_log_created:
+                        os.makedirs(os.path.dirname(session_log_path), exist_ok=True)
+                        with open(session_log_path, "w", newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(["Timestamp", "BPM", "RR", "Battery"])
+                            logger.debug(f"Created session log at {session_log_path}")
+                        session_log_created = True
             except TimeoutError:
                 logger.error("Connection timed out. Retrying in 3s...")
                 await asyncio.sleep(3)
@@ -593,9 +626,13 @@ async def main():
                 await asyncio.sleep(3)
             except (BleakError, OSError):
                 logger.error("BLE Error. Retrying in 15s...")
+                type, value, traceback = sys.exc_info()
+                logger.debug(f"Exception: {type} - {value}")
                 await asyncio.sleep(15)
             except (asyncio.exceptions.CancelledError):
                 logger.error("System error? Probably not good. Retrying in 3s...")
+                type, value, traceback = sys.exc_info()
+                logger.debug(f"Exception: {type} - {value}")
                 await asyncio.sleep(3)
 
             # finally:

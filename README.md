@@ -19,6 +19,7 @@ saved_name = Polar H10 XXXXXXXX
 write_bpm_to_file = False
 write_bpm_file_path = bpm.txt
 console_log_level = info
+log_sessions_to_csv = False
 
 [dummy]
 hi_bpm = 190
