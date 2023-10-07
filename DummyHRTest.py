@@ -3,7 +3,15 @@ import multiprocessing
 import time
 from Includes.ConfigFunctions import load_config, get_config_value, set_config_value, save_config
 from distutils.util import strtobool
-import os
+import os, sys
+
+# From https://stackoverflow.com/a/42615559
+# determine if application is a script file or frozen exe
+if getattr(sys, 'frozen', False):
+    application_path = os.path.dirname(sys.executable)
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
 def beat_process(stop_event, new_rr, OSC_IP, OSC_PORT, PULSE_LENGTH, OSC_PREFIX):
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
     while not stop_event.is_set():
@@ -60,7 +68,7 @@ if "__main__" == __name__:
     PULSE_LENGTH = 100
     OSC_PREFIX = "/avatar/parameters/"
 
-    config = load_config()
+    config = load_config(application_path)
     OSC_IP = get_config_value(config, "osc", "ip", OSC_IP, True)
     OSC_PORT = int(get_config_value(config, "osc", "port", OSC_PORT, True))
     OSC_PREFIX = get_config_value(config, "osc", "prefix", OSC_PREFIX, True)

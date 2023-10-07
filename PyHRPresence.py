@@ -24,10 +24,19 @@ from pynput.keyboard import Key, Listener
 import csv
 from async_timeout import timeout
 from Includes.ConfigFunctions import load_config, get_config_value, set_config_value, save_config
+import traceback
+
+# From https://stackoverflow.com/a/42615559
+# determine if application is a script file or frozen exe
+if getattr(sys, 'frozen', False):
+    application_path = os.path.dirname(sys.executable)
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
 
 # Create a logger
 logger = logging.getLogger(__name__)
 log_path = 'pyhrpresence.log'
+log_path = os.path.join(application_path, 'pyhrpresence.log')
 
 file_handler = RotatingFileHandler(log_path, maxBytes=1024*1024*10, backupCount=3)
 file_handler.setLevel(logging.DEBUG)
@@ -48,12 +57,6 @@ logger.addHandler(file_handler)
 
 logger.setLevel(logging.DEBUG)
 
-# From https://stackoverflow.com/a/42615559
-# determine if application is a script file or frozen exe
-if getattr(sys, 'frozen', False):
-    application_path = os.path.dirname(sys.executable)
-else:
-    application_path = os.path.dirname(os.path.abspath(__file__))
 
 # This is kinda awful but it will be very helpful for debugging
 old_hook = sys.excepthook
@@ -156,7 +159,7 @@ class HRData:
         self.battery = -1
         self.only_positive_floathr = bool(strtobool(get_config_value(config, "osc", "only_positive_floathr", "False", True)))
         self.should_txt_write = bool(strtobool(get_config_value(config, "misc", "write_bpm_to_file", "False", True)))
-        self.txt_write_path = get_config_value(config, "misc", "write_bpm_file_path", "bpm.txt", True)
+        self.txt_write_path = os.path.join(application_path, get_config_value(config, "misc", "write_bpm_file_path", "bpm.txt", True))
         self.timer = TimeoutTimer(15, self.timeout_callback)
         self.disconnect_call = None
         self.session_log_path = session_log_path
@@ -216,8 +219,7 @@ class HRData:
         send_osc(self.is_connected, self.bpm, self.newest_rr, self.only_positive_floathr, self.should_txt_write, self.txt_write_path)
 
         # Not checking if logging is enabled, since if it wasn't, this would never be True
-        if session_log_created:
-            session_log_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "session_logs", f"PyHRP-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+        if session_log_created and self.bpm > 0:
             with open(self.session_log_path, "a", newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), self.bpm, self.newest_rr, self.battery])
@@ -566,7 +568,7 @@ async def main():
     global osc_client, OSC_IP, OSC_PORT, OSC_PREFIX, session_log_created
 
     # Read config
-    config = load_config()
+    config = load_config(application_path)
     OSC_IP = get_config_value(config, "osc", "ip", OSC_IP, True)
     OSC_PORT = int(get_config_value(config, "osc", "port", OSC_PORT, True))
     OSC_PREFIX = get_config_value(config, "osc", "prefix", OSC_PREFIX, True)

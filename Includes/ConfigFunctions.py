@@ -1,10 +1,10 @@
-import configparser
+import configparser, os
 
 config_file_path = 'pyhrpresence.ini'
 
-def load_config():
+def load_config(application_path):
     config = configparser.ConfigParser()
-    config.read(config_file_path)
+    config.read(os.path.join(application_path, config_file_path))
     return config
 
 
