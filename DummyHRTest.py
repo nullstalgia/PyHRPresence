@@ -14,9 +14,12 @@ else:
 
 def beat_process(stop_event, new_rr, OSC_IP, OSC_PORT, PULSE_LENGTH, OSC_PREFIX):
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
+    heart_beat_toggle = False
     while not stop_event.is_set():
         rr = new_rr.value
         if rr > 0:
+            heart_beat_toggle = not heart_beat_toggle
+            osc_client.send_message(OSC_PREFIX+"HeartBeatToggle", heart_beat_toggle)
             osc_client.send_message(OSC_PREFIX+"isHRBeat", True)
             time.sleep(PULSE_LENGTH/1000) # /1000's to convert to seconds
             osc_client.send_message(OSC_PREFIX+"isHRBeat", False)

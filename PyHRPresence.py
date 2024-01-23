@@ -102,10 +102,13 @@ def beat_process(stop_event, new_rr, osc_settings, pulse_time):
     osc_ip = osc_settings["ip"]
     osc_port = osc_settings["port"]
     osc_prefix = osc_settings["prefix"]
+    osc_flip_flop_beat_state = False
     osc_client = SimpleUDPClient(osc_ip, osc_port)
     while not stop_event.is_set():
         rr = new_rr.value
         if rr > 0:
+            osc_flip_flop_beat_state = not osc_flip_flop_beat_state
+            osc_client.send_message(osc_prefix+"HeartBeatToggle", osc_flip_flop_beat_state)
             osc_client.send_message(osc_prefix+"isHRBeat", True)
             time.sleep(pulse_time/1000) # /1000's to convert to seconds
             osc_client.send_message(osc_prefix+"isHRBeat", False)
@@ -114,7 +117,7 @@ def beat_process(stop_event, new_rr, osc_settings, pulse_time):
                 new_wait_time = rr
             time.sleep(new_wait_time)
         else:
-            time.sleep(1)
+            time.sleep(0.5)
 
 
 class TimeoutTimer:
