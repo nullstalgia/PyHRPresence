@@ -13,7 +13,7 @@ import os
 import struct
 from io import BytesIO
 import time
-from pprint import pprint
+from pprint import pprint, pformat
 from distutils.util import strtobool
 import multiprocessing
 import sys
@@ -168,9 +168,12 @@ class HRData:
         self.session_log_path = session_log_path
     
     def update_hr(self, data, is_connected):
-        self.timer.reset()
-        self.is_connected = is_connected
         self.bpm = data['BeatsPerMinute']
+        self.is_connected = is_connected
+        if self.bpm > 0 or is_connected:
+            self.timer.reset()
+        else:
+            self.timer.stop()
         
         if data['BeatsPerMinute'] == 0:
             self.rr = 0
@@ -215,6 +218,8 @@ class HRData:
             
         if self.battery > -1:
             print(f"Battery: {Fore.RED if self.battery < 30 else Fore.WHITE}{self.battery}%{Fore.RESET}")
+        
+        #print(f"Status: {data['Status']}")
 
         print_histogram(self.bpm_history, 30, 250)
 
@@ -327,10 +332,11 @@ class HeartRateMonitor:
         self.battery_characteristic = None
         self.receivedZero = 0
         self.receivedNonZero = 0
+        self.waiting_for_disconnect_call = False
         
         
     async def connect(self):
-        self.client = BleakClient(self.device_address, disconnected_callback=self.on_disconnect)
+        self.client = BleakClient(self.device_address, disconnected_callback=self.on_disconnect, timeout=10)
         logger.debug("Created client.")
         sys.stdout.flush()
         
@@ -338,11 +344,14 @@ class HeartRateMonitor:
         async with timeout(30) as cm:
             try:
                 logger.debug("Connecting.")
-                sys.stdout.flush()
-                self.connected = await self.client.connect()
-                logger.debug("Connected, checking if battery service is available.")
-                sys.stdout.flush()
+
+                if not self.waiting_for_disconnect_call:
+                    self.connected = await self.client.connect()
+                    logger.debug("Connected, checking if battery service is available.")
+                else:
+                    logger.debug("Not reconnecting yet, didn't get a disconnect callback.")
                 if self.connected:
+                    self.waiting_for_disconnect_call = True
                     await self.client.start_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID, self.on_hr_data_received)
                     # Check if the device has the battery service
                     for service in self.client.services:
@@ -354,7 +363,11 @@ class HeartRateMonitor:
                                     self.battery_characteristic = characteristic
                                     break
                     
-            except asyncio.exceptions.CancelledError:
+            except (asyncio.exceptions.CancelledError, TimeoutError):
+                type, value, tb = sys.exc_info()
+                logger.debug(f"Exception: {type} - {value}")
+                logger.debug(f"{pformat(tb)}")
+                logger.debug(f"{pformat(traceback.format_exc())}")
                 logger.error("Couldn't connect to device, try again?")
                 pass
         if cm.expired:
@@ -366,13 +379,23 @@ class HeartRateMonitor:
         #if self.connected:
         if self.client is not None:
             try:
+                await asyncio.wait_for(asyncio.sleep(3600), timeout=5.0)
                 await self.client.stop_notify(HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
                 await self.client.disconnect()
+                logger.debug("Disconnected successfully?")
+                self.connected = False
+                self.waiting_for_disconnect_call = False
             except (KeyError, BleakError, AttributeError):
                 # Not exactly sure why these get thrown, hopefully this helps
                 # I think sometimes on disconnecting when it may already be DC'd, it just double freaks out and throws exceptions?
 
                 # Adding this to see if it helps with not re-connecting after timing out/leaving BLE range.
+                logger.debug("Exception handled while disconnecting.")
+                self.connected = False
+                self.waiting_for_disconnect_call = False
+                pass
+            except asyncio.exceptions.TimeoutError:
+                logger.debug("Timed out while disconnecting...")
                 self.connected = False
                 pass
 
@@ -380,6 +403,8 @@ class HeartRateMonitor:
         self.connected = False
         self.hrdata.update_hr_to_zero()
         logger.info("Disconnected!")
+        self.waiting_for_disconnect_call = False
+
 
     async def on_hr_data_received(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         raw = read_hr_buffer(data)
@@ -390,6 +415,11 @@ class HeartRateMonitor:
         if bpm == 0:
             self.receivedZero += 1
             self.receivedNonZero = 0
+            logger.debug("Received zero BPM...")
+
+            logger.debug(f"Characteristic: {characteristic.description}")
+            logger.debug(f"Data: {data.hex()}")
+            logger.debug(f"{pformat(characteristic)}")
         elif bpm > 0 and self.connected == False:
             self.receivedNonZero += 1
             self.receivedZero = 0
@@ -397,7 +427,7 @@ class HeartRateMonitor:
         if self.client is not None:
             if self.receivedZero > 10:
                 self.connected = False
-                await self.client.disconnect()
+                await self.disconnect()
             elif self.receivedNonZero > 5:
                 self.connected = True
                 self.receivedNonZero = 0
@@ -488,7 +518,12 @@ async def select_device(config):
     input_thread_ever_started = False
     logger.info("Scanning for BLE Heart Rate devices...")
     sys.stdout.flush()
-    await scanner.start()
+    try:
+        await scanner.start()
+    except OSError:
+        logger.error(Fore.RED + "Error starting scanner. Is Bluetooth enabled?" + Fore.RESET)
+        return None
+    
     check_time = datetime.datetime.now() + datetime.timedelta(seconds=5)
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=120)
     while datetime.datetime.now() < end_time:
@@ -615,6 +650,7 @@ async def main():
         hrdata.disconnect_call = monitor.disconnect # type: ignore
         # TODO: Find ways around pylance complaining about assigning to None
         beat_process_thread.start()
+        reconnect_attempts = 0
         while True:
             try:
                 if not monitor.connected:
@@ -646,11 +682,16 @@ async def main():
                 type, value, traceback = sys.exc_info()
                 logger.debug(f"Exception: {type} - {value}")
                 await asyncio.sleep(3)
-
-            # finally:
-            #     await monitor.disconnect()
-            #     await asyncio.sleep(3)
-            #     continue
+            finally:
+                if monitor.connected:
+                    reconnect_attempts = 0
+                else:
+                    await monitor.disconnect()
+                    await asyncio.sleep(3)
+                    reconnect_attempts += 1
+                    if reconnect_attempts > 10:
+                        logger.error("Failed to reconnect after 10 attempts. Exiting.")
+                        break
 
             if not monitor.connected:
                 logger.info("Attempting to reconnect...")
