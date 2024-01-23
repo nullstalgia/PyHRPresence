@@ -29,12 +29,13 @@ loops_before_dc = 5
 
 ## OSC Parameters
 
-| Parameter       | Path                               | Description                        |
-|-----------------|------------------------------------|------------------------------------|
-| `HR`            | `/avatar/parameters/HR`            | actual heartrate as int            |
-| `floatHR`       | `/avatar/parameters/floatHR`       | maps 0:255 to -1.0:1.0 or 0.0:1.0    |
-| `isHRBeat`      | `/avatar/parameters/isHRBeat`      | bool set when heart beats          |
-| `isHRConnected` | `/avatar/parameters/isHRConnected` | bool set when HR monitor connected |
-| `RRInterval`    | `/avatar/parameters/RRInterval`    | heart beat interval int in ms      |
+| Parameter         | Path                                 | Description                          |
+|-------------------|--------------------------------------|--------------------------------------|
+| `HR`              | `/avatar/parameters/HR`              | actual heartrate as int              |
+| `floatHR`         | `/avatar/parameters/floatHR`         | maps 0:255 to -1.0:1.0 or 0.0:1.0    |
+| `isHRBeat`        | `/avatar/parameters/isHRBeat`        | bool, pulses on each heart beat      |
+| `HeartBeatToggle` | `/avatar/parameters/HeartBeatToggle` | bool, flips state on each heart beat |
+| `isHRConnected`   | `/avatar/parameters/isHRConnected`   | bool, set when HR monitor connected  |
+| `RRInterval`      | `/avatar/parameters/RRInterval`      | heart beat interval int in ms        |
 
 Inspired by HRPresence by [@Naraenda](https://github.com/Naraenda) and [@Natsumi-sama](https://github.com/Natsumi-sama)'s fork.
