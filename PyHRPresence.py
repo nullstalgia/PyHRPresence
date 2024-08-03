@@ -25,6 +25,7 @@ import csv
 from async_timeout import timeout
 from Includes.ConfigFunctions import load_config, get_config_value, set_config_value, save_config
 import traceback
+import numpy as np
 
 # From https://stackoverflow.com/a/42615559
 # determine if application is a script file or frozen exe
@@ -176,7 +177,7 @@ class HRData:
             self.timer.stop()
         
         if data['BeatsPerMinute'] == 0:
-            self.rr = 0
+            self.rr = [0]
             self.newest_rr = 0
         else:
             if self.bpm > self.bpm_session_max:
@@ -188,15 +189,17 @@ class HRData:
                 
             if "RRIntervals" in data.keys():
                 self.rr = data['RRIntervals']
+                if type(self.rr) == int:
+                    self.rr = [self.rr]
                 self.newest_rr = self.rr[-1]
                 self.newest_rr *= RR_CONVERSION_FACTOR
                 self.newest_rr = int(self.newest_rr)
             else:
-                self.rr = int(60000/data['BeatsPerMinute'])
-                self.newest_rr = self.rr
+                self.rr = [int(60000/data['BeatsPerMinute'])]
+                self.newest_rr = self.rr[0]
 
             self.bpm_history.append(self.bpm)
-            self.rr_history.append(self.rr)
+            self.rr_history.extend(self.rr)
             while len(self.bpm_history) > self.data_length:
                 self.bpm_history.pop(0)
             while len(self.rr_history) > self.data_length:
@@ -215,7 +218,43 @@ class HRData:
             print(f"RR: {self.rr} (ms)")
         else:
             print(f"RR: {self.rr}ms")
+        
+        should_twitch_up = False
+        should_twitch_down = False
+
+        twitch_amount = 50
+
+        # Print out the RR differences (in ms), longer differences are shown in green, shorter in red
+        if len(self.rr_history) > 6:
+            for i in range(-1, -len(self.rr)-1, -1):
+                #print("RR Diff:", self.rr_history[i] - self.rr_history[i-1])
+                if self.rr_history[i] - self.rr_history[i-1] > twitch_amount:
+                    should_twitch_up = True
+                elif self.rr_history[i] - self.rr_history[i-1] < -twitch_amount:
+                    should_twitch_down = True
+
+
+            # Go through each RR interval and compare it to the previous one
+            # Only do this for the last 5 RR intervals
+            for i in range(-1, -6, -1):
+                if self.rr_history[i] - self.rr_history[i-1] > 0:
+                    print(f"{Fore.GREEN}+{self.rr_history[i] - self.rr_history[i-1]}{Fore.RESET}", end=" ")
+                else:
+                    print(f"{Fore.RED}{self.rr_history[i] - self.rr_history[i-1]}{Fore.RESET}", end=" ")
+            print()
             
+            self.print_rr_history()
+
+            # Calculate successive differences, square them, and compute the mean
+            differences = np.diff(self.rr_history)
+            squared_differences = differences ** 2
+            mean_squared_differences = np.mean(squared_differences)
+
+            # Calculate RMSSD
+            rmssd = np.sqrt(mean_squared_differences)
+
+            print(f"RMSSD: {rmssd:.2f}")
+
         if self.battery > -1:
             print(f"Battery: {Fore.RED if self.battery < 30 else Fore.WHITE}{self.battery}%{Fore.RESET}")
         
@@ -224,7 +263,7 @@ class HRData:
         print_histogram(self.bpm_history, 30, 250)
 
         self.rr_output.value = self.newest_rr
-        send_osc(self.is_connected, self.bpm, self.newest_rr, self.only_positive_floathr, self.should_txt_write, self.txt_write_path)
+        send_osc(self.is_connected, self.bpm, self.rr_history, self.only_positive_floathr, self.should_txt_write, self.txt_write_path, should_twitch_up, should_twitch_down)
 
         # Not checking if logging is enabled, since if it wasn't, this would never be True
         if session_log_created and self.bpm > 0:
@@ -232,6 +271,16 @@ class HRData:
                 writer = csv.writer(f)
                 writer.writerow([datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), self.bpm, self.newest_rr, self.battery])
 
+    def print_rr_history(self):
+        print("[", end="")
+        last_rr = 0
+        for rr in self.rr_history:
+            if rr - last_rr > 0:
+                print(f"{Fore.GREEN}{rr}{Fore.RESET}, ", end=" ")
+            else:
+                print(f"{Fore.RED}{rr}{Fore.RESET}, ", end=" ")
+            last_rr = rr
+        print("]")
 
     def update_hr_to_zero(self, connected=False):
         self.bpm = 0
@@ -250,21 +299,36 @@ class HRData:
         # TODO: Find ways around pylance complaining about awaiting Never and calling None
 
 
-def send_osc(is_connected, bpm, newest_rr, only_positive_floathr, should_txt_write, txt_write_path):
+def send_osc(is_connected, bpm, rr_history, only_positive_floathr, should_txt_write, txt_write_path, should_twitch_up=False, should_twitch_down=False):
     global osc_client
     if osc_client is not None:
         bundle = []
         bundle.append((OSC_PREFIX+"isHRConnected", is_connected))
         if is_connected:
             bundle.append((OSC_PREFIX+"HR", bpm))
-            bundle.append((OSC_PREFIX+"RRInterval", newest_rr))
+            bundle.append((OSC_PREFIX+"RRInterval", rr_history[-1]))
             if only_positive_floathr:
                 bundle.append((OSC_PREFIX+"floatHR", bpm/255.0)) # 0-1 (Less accurate, but may be more useful for some applications)
             else:
                 bundle.append((OSC_PREFIX+"floatHR", (bpm*0.0078125) - 1.0)) # -1.0-1.0
         else:
             bundle.append((OSC_PREFIX+"isHRBeat", False))
-            
+
+        if len(rr_history) > 1:
+            bundle.append((OSC_PREFIX+"isHRRising", rr_history[-1] - rr_history[-2] > 0))
+
+        if should_twitch_up:
+            bundle.append((OSC_PREFIX+"HRTwitchUp", True))
+            bundle.append((OSC_PREFIX+"HRTwitchDown", False))
+        elif should_twitch_down:
+            bundle.append((OSC_PREFIX+"HRTwitchUp", False))
+            bundle.append((OSC_PREFIX+"HRTwitchDown", True))
+        else:
+            bundle.append((OSC_PREFIX+"HRTwitchUp", False))
+            bundle.append((OSC_PREFIX+"HRTwitchDown", False))
+
+        
+
         for msg in bundle:
             osc_client.send_message(msg[0], msg[1])
 
@@ -290,38 +354,6 @@ def print_histogram(data, min_value, max_value):
     for row in reversed(histogram):
         print(''.join(row))
 
-def read_hr_buffer(data):
-    length = len(data)
-    if length == 0:
-        return None
-
-    ms = BytesIO(data)
-    flags = ms.read(1)[0]
-    isshort = flags & 1
-    contactSensor = (flags >> 1) & 3
-    hasEnergyExpended = flags & 8
-    hasRRInterval = flags & 16
-    minLength = 3 if isshort else 2
-
-    if len(data) < minLength:
-        return None
-
-    reading = {}
-    reading['Flags'] = flags
-    reading['Status'] = contactSensor
-    reading['BeatsPerMinute'] = struct.unpack('<H', ms.read(2))[0] if isshort else ms.read(1)[0]
-
-    if hasEnergyExpended:
-        reading['EnergyExpended'] = struct.unpack('<H', ms.read(2))[0]
-
-    if hasRRInterval:
-        rrvalueCount = int((len(data) - ms.tell()) / 2)
-        rrvalues = [struct.unpack('<H', ms.read(2))[0] for _ in range(rrvalueCount)]
-        reading['RRIntervals'] = rrvalues
-
-    return reading
-
-
 class HeartRateMonitor:
     def __init__(self, device_address, hrdata: HRData):
         self.device_address = device_address
@@ -329,6 +361,7 @@ class HeartRateMonitor:
         self.connected = False
         self.hrdata = hrdata
         self.last_battery_run = 0
+        self.ignore_rr_count = 0
         self.battery_characteristic = None
         self.receivedZero = 0
         self.receivedNonZero = 0
@@ -405,9 +438,54 @@ class HeartRateMonitor:
         logger.info("Disconnected!")
         self.waiting_for_disconnect_call = False
 
+    def read_hr_buffer(self, data):
+        length = len(data)
+        if length == 0:
+            return None
+
+        ms = BytesIO(data)
+        flagsByte = ms.read(1)[0]
+        
+        bpmIs16bit = flagsByte & 0x01
+        sensorContact = flagsByte & 0x06
+        sensorContactSupported = flagsByte & 0x04
+        hasEnergyExpended = flagsByte & 0x08
+        hasRRInterval = flagsByte & 0x10
+        #print(f"Flags: {flagsByte:08b}")
+        #print(f"has rr: {hasRRInterval}")
+        minLength = 3 if bpmIs16bit else 2
+
+        # Flags: 00010000
+
+        if len(data) < minLength:
+            return None
+
+        reading = {}
+        reading['Flags'] = flagsByte
+        reading['Status'] = sensorContact
+        if bpmIs16bit:
+            reading['BeatsPerMinute'] = struct.unpack('<H', ms.read(2))[0]
+        else:
+            reading['BeatsPerMinute'] = struct.unpack('<B', ms.read(1))[0]
+        
+        if hasEnergyExpended:
+            reading['EnergyExpended'] = struct.unpack('<H', ms.read(2))[0]
+
+        rr_values = []
+        if hasRRInterval:
+            if self.ignore_rr_count <= 0:
+                while ms.tell() < len(data):
+                    rr_values.append(struct.unpack('<H', ms.read(2))[0])
+                reading['RRIntervals'] = rr_values
+            else:
+                self.ignore_rr_count -= 1
+        else:
+            self.ignore_rr_count = 5
+                
+        return reading
 
     async def on_hr_data_received(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
-        raw = read_hr_buffer(data)
+        raw = self.read_hr_buffer(data)
         self.hrdata.update_hr(raw, self.connected)
         bpm = raw['BeatsPerMinute']
         if not self.connected or bpm == 0:
@@ -631,7 +709,7 @@ async def main():
 
     hrdata = HRData(new_rr, config, session_log_path)
 
-    send_osc(False, 0, 0, hrdata.only_positive_floathr, hrdata.should_txt_write, hrdata.txt_write_path)
+    send_osc(False, 0, [], hrdata.only_positive_floathr, hrdata.should_txt_write, hrdata.txt_write_path)
     device = await select_device(config)
 
     # Should only save after device selection and hrdata init, since they may modify the config
